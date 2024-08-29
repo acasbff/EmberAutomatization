@@ -90,6 +90,17 @@ The approach uses a series of ARIMA models organised as follows:
 Use data from download file because we need regional EU data which is not available through the API.
 
 ```{r}
+#| echo: false
+###github update
+### in the terminal go to this working directory and do quarto render
+### git add .
+### git commit -m "Some update text"
+### git push origin gh-pages
+### verify in https://acasbff.github.io/EmberAutomization/
+```
+
+
+```{r}
 # Read the ISO codes from the file
 iso_codes_df <- read.delim('/Users/acas/Dropbox/BFF/projects/BFFcountries.txt')
 iso_codes <- iso_codes_df$Iso3

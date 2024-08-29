@@ -1,5 +1,7 @@
 project:
   type: website
+  output-dir: .  # Set the output directory to the root
+
 
 website:
   title: "Optimization of Ember Electricity Generation Data"
