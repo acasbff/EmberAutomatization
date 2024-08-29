@@ -1,0 +1,245 @@
+---
+title: "Coal to Gas - Comparing BFF DBs with GEM DBs" 
+format: 
+  html:
+    self-contained: true
+    code-fold: true
+    toc: true
+    toc-float:
+      collapsed: true
+      smooth-scroll: true
+    theme: default
+    number-sections: false
+execute:
+  echo: true
+  cache: false
+  warning: false
+  message: false
+  fig-align: center
+  progress: true
+  verbose: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+date: "`r Sys.Date()`"
+author: 'Ana Afonso Silva'
+engine: knitr
+---
+
+```{css, echo = FALSE}
+h1 {
+  font-family: 'Montserrat';
+  font-weight: bold;
+  color: #00a1e3;
+}
+
+h2 {
+  border-top: 1px solid #ccc; /* Adjust color and size as needed */
+  padding-top: 10px; /* Add some space above the line */
+}
+
+h3 {
+  border-bottom: 1px solid #ccc; /* Adjust color and size as needed */
+  padding-top: 5px; /* Add some space above the line */
+}
+
+body {
+  font-family: 'Open sans', sans-serif;
+}
+
+```
+
+```{r}
+#| echo: false
+
+library(tidyverse)
+library(readxl)
+library(here)
+library(knitr)
+library(kableExtra)
+library(openxlsx)
+library(hues)
+library(DT)
+
+```
+
+### Prepare gas location IDs with GEM and BFF gas datasets
+
+```{r}
+## loas BFF unit IDs with GEM IDs and coal to gas information
+## data from BASE2_units_last_timestamp database query on 2024/08/09
+bffGas <- read_excel('/Users/acas/Dropbox/BFF/projects/matchingCoalGasOther/20240809_GasDB.xlsx') %>% 
+  select(gem_unit_id , bff_unit_id, bff_plant_id, plant_name_eng, unit_name, `coal-to-gas`) %>% 
+  rename(bff_plant_name = plant_name_eng, 
+         bff_unit_name = unit_name,
+         bff_coalToGas = `coal-to-gas`)
+
+## load GEM gas units with other unit IDs
+gemGas <- read_excel('/Users/acas/Dropbox/BFF/projects/GasRelated/dataChecks/DB_comparisons/GOGPT_dl2024-03-29_filteredCountryFossilGas.xlsx') %>% 
+    select(Country, `Project ID`,	`Unit ID`,	`Project Name`,	`Unit Name`,Status,
+           `Non WEPP location IDs`,	`Non WEPP unit IDs`) %>% 
+    mutate(EIC = lapply(str_extract_all(paste0(`Non WEPP location IDs`, ", ", 
+                                               `Non WEPP unit IDs`),
+                                        "ENTSO-E: [^,]+"), 
+                        function(x) if(length(x) > 0) x else NA_character_)) %>%
+    mutate(EIC_fromGasGEM = unlist(lapply(EIC, paste, collapse = ", ")),
+           EIC_fromGasGEM = ifelse(is.na(EIC_fromGasGEM), NA,
+                                   str_remove_all(EIC_fromGasGEM,"ENTSO-E: "))) %>% 
+  select(-`Non WEPP location IDs`, -`Non WEPP unit IDs`, -EIC)  %>% 
+  rename(gem_plant_id = `Project ID`,
+         gem_unit_id = `Unit ID`, 
+         gem_plant_name = `Project Name`,   
+         gem_unit_name = `Unit Name`)
+
+## export list of gas units in GEM and BFF data 
+## several IDs don't seem to be found in https://www.entsoe.eu/data/energy-identification-codes-eic/eic-approved-codes/
+#filter(gemGas, str_detect(EIC_fromGasGEM, ", ")) %>% 
+select(gemGas, -gem_unit_name, -Status) %>% 
+  inner_join(select(bffGas, gem_unit_id, bff_unit_id)) %>% 
+  filter(!EIC_fromGasGEM  %in% "NA") %>% 
+  write.xlsx('20240809_gasGEMBFF_EICids.xlsx',
+             colNames = TRUE, colWidths = 30)
+
+## delete multiple EIC IDs before merging gemGas to BFF IDs
+gemGasClean <- gemGas %>% 
+  # mutate(EIC_fromGasGEM = case_when(str_detect(EIC_fromGasGEM, ", ") ~ NA,
+  #                                EIC_fromGasGEM %in% "NA" ~ NA,
+  #                                TRUE~str_remove(EIC_fromGasGEM,"ENTSO-E: "))) %>% 
+  select(-Country, -Status, -EIC_fromGasGEM)
+
+### matching only BFF data with GEM IDs that can be matched to GEM
+gembffGas <- full_join(gemGasClean, bffGas) %>% 
+  mutate(database = "gas",
+         bffGEM_joinNote = case_when(is.na(gem_unit_id) ~ "Verifing why GEM doesn't have this unit", 
+                              is.na(bff_unit_id) ~ "Verifing why BFF doesn't have this unit",
+                              TRUE~"Ok"))
+
+gembffGas %>% 
+    datatable(
+        filter = "top",  
+        rownames = FALSE, 
+        extensions = 'Scroller', 
+        options = list(autoWidth = TRUE,
+                       deferRender = TRUE,
+                       scrollY = 300,
+                       scrollX = TRUE,    # Enable horizontal scrolling
+                       scroller = TRUE, 
+                       initComplete = JS(
+                           "function(settings, json) {",
+                           "$('.dataTables_wrapper').css('font-size', '10px');",  # Adjust font size here
+                           "}")))
+```
+
+### Prepare coal location IDs with GEM and BFF coal datasets
+
+```{r}
+## load BFF coal mapping done into 20240809_CompletedGEM_issues.xlsx
+bffCoal <- read_excel('/Users/acas/Dropbox/BFF/projects/CoalRelated/coalDB/20240809_CompletedGEM_issues.xlsx') %>% 
+  select(gem_unit_id, bff_plant_id, bff_unit_id, bff_plant_name, bff_unit_name) 
+
+## load GEM coal
+gemCoal <- read_excel('/Users/acas/Dropbox/BFF/projects/CoalRelated/GEM_files/GCPT raw download Aug 8, 2024 (Europe + Turkiye).xlsx') %>% 
+  select(`GEM location ID`, `GEM unit/phase ID`, `Plant name`, `Unit name`) %>% 
+  rename(gem_plant_id =`GEM location ID`, 
+         gem_unit_id = `GEM unit/phase ID`, 
+         gem_plant_name = `Plant name`, 
+         gem_unit_name = `Unit name`) 
+
+## only keep Coal units that can be matched back to GEM, until issues are sorted
+gembffCoal <- full_join(gemCoal, bffCoal) %>% 
+  mutate(database = "coal",
+         bffGEM_joinNote = case_when(is.na(gem_unit_id) ~ "Verifing why GEM doesn't have this unit", 
+                              is.na(bff_unit_id) ~ "Verifing why BFF doesn't have this unit",
+                              TRUE~"Ok"))
+
+gembffCoal %>% 
+    datatable(
+        filter = "top",  
+        rownames = FALSE, 
+        extensions = 'Scroller', 
+        options = list(autoWidth = TRUE,
+                       deferRender = TRUE,
+                       scrollY = 300,
+                       scrollX = TRUE,    # Enable horizontal scrolling
+                       scroller = TRUE, 
+                       initComplete = JS(
+                           "function(settings, json) {",
+                           "$('.dataTables_wrapper').css('font-size', '10px');",  # Adjust font size here
+                           "}")))
+#### some units GEM considers to be from the same power plant are considered to be from a different power plant in the same location, there is a mismatch between power plants
+```
+
+### Prepare coal and gas matching to export
+
+```{r}
+## export three sheets: 1) coal focus, 2) gas focus, 3) coal + gas focus by GEM plant ID
+
+wb <- createWorkbook()
+addWorksheet(wb, "Coal BFF-GEM")
+addWorksheet(wb, "Gas BFF-GEM")
+addWorksheet(wb, "Coal + Gas GEM-BFF")
+
+### coal sheet 1
+## add gas_bff plant IDs
+finalCoal <- gembffCoal %>% 
+  left_join(drop_na(distinct(select(gembffGas, gem_plant_id, bff_plant_id, bff_plant_name))),
+           by = "gem_plant_id", suffix = c("_coal","_gas"),
+           relationship = "many-to-many") %>% 
+  select(bff_plant_id_coal, bff_unit_id, bff_plant_name_coal, bff_unit_name,
+         gem_plant_id,  gem_unit_id, gem_plant_name, gem_unit_name,
+         bffGEM_joinNote, bff_plant_id_gas, bff_plant_name_gas) %>% 
+  rename( bff_unit_id_coal =  bff_unit_id, 
+          bff_unit_name_coal = bff_unit_name) %>% 
+  arrange(bff_unit_id_coal, gem_unit_id)
+
+### gas sheet 2
+## add coal_bff plant IDs
+finalGas <- gembffGas %>% 
+  left_join(drop_na(distinct(select(gembffCoal, gem_plant_id, bff_plant_id, bff_plant_name))),
+           by = "gem_plant_id", suffix = c("_gas","_coal"),
+           relationship = "many-to-many") %>% 
+  select(bff_plant_id_gas, bff_unit_id, bff_plant_name_gas, bff_unit_name,bff_coalToGas,
+         gem_plant_id,  gem_unit_id, gem_plant_name, gem_unit_name,
+         bffGEM_joinNote, bff_plant_id_coal, bff_plant_name_coal) %>% 
+  rename( bff_unit_id_gas =  bff_unit_id, 
+          bff_unit_name_gas = bff_unit_name) %>% 
+  arrange(bff_unit_id_gas, gem_unit_id)
+
+### coal + gas sheet 3
+gembffCoalGas <- bind_rows(gembffCoal, gembffGas) %>%
+   arrange(gem_plant_id,  gem_unit_id )
+
+plantUnitsType <- gembffCoalGas %>% 
+  select(gem_plant_id, database) %>% 
+  distinct() %>% 
+  mutate(value = 1) %>% 
+  pivot_wider(names_from = database, values_from = value) %>% 
+  mutate(plantUnitsFuelType = case_when(is.na(gem_plant_id) ~ "To check if GEM doesn't have this power plant",
+                                        is.na(coal) & !is.na(gas) ~ "Just gas units", 
+                                        !is.na(coal) & is.na(gas) ~ "Just coal units", 
+                                        !is.na(coal) & !is.na(gas) ~ "Both coal and gas units")) %>% 
+  select(-coal, -gas)
+
+finalCoalGas <- left_join(gembffCoalGas, plantUnitsType)
+
+writeData(wb, sheet = "Coal BFF-GEM", x = finalCoal)
+writeData(wb, sheet = "Gas BFF-GEM", x = finalGas)
+writeData(wb, sheet = "Coal + Gas GEM-BFF", x = finalCoalGas)
+
+saveWorkbook(wb, "Coal_Gas_GEM_BFF.xlsx", overwrite = TRUE)
+
+finalCoalGas %>% 
+    datatable(
+        filter = "top",  
+        rownames = FALSE, 
+        extensions = 'Scroller', 
+        options = list(autoWidth = TRUE,
+                       deferRender = TRUE,
+                       scrollY = 300,
+                       scrollX = TRUE,    # Enable horizontal scrolling
+                       scroller = TRUE, 
+                       initComplete = JS(
+                           "function(settings, json) {",
+                           "$('.dataTables_wrapper').css('font-size', '10px');",  # Adjust font size here
+                           "}")))
+```

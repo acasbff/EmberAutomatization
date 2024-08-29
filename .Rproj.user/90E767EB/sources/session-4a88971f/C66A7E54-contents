@@ -1,0 +1,923 @@
+---
+title: "Optimization of Ember electricity generation data with ARIMA model and regional EU adjustments"
+format: 
+  html:
+    include-in-header:
+      - text: |
+          <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    self-contained: true
+    code-fold: show  # This option ensures that the code is visible by default with a fold button
+    toc: true
+    toc-float:
+      collapsed: false
+      smooth-scroll: true
+    theme: default
+    number-sections: false
+execute:
+  echo: true
+  warning: false
+  message: false
+  fig-align: center
+  fig-height: 6    # Set default figure height for all chunks
+  fig-width: 8 
+  progress: true
+  verbose: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+date: "`r Sys.Date()`"
+author: 'Ana Afonso Silva'
+---
+
+```{r}
+#| echo: false
+library(tidyverse)
+library(patchwork)
+library(readxl)
+library(showtext)
+library(ggtext)
+library(httr)
+library(jsonlite)
+library(lubridate)
+library(forecast)
+library(waterfalls)
+library(here)
+library(shadowtext)
+library(ggh4x)
+library(ggrepel)
+library(kableExtra)
+library(DT)
+
+### setup of ember API function
+# Set API key and base URL
+# my_api_key <- "51356ef8-f7dd-43a1-9629-1965b7830a26"
+# base_url <- "https://api.ember-climate.org"
+
+### needs to set the type of data, uses iso3 to fetch country data
+## frequency: "yearly", "monthly"
+## dataset:"electricity-generation", "power-sector-emissions", "electricity-demand", "carbon-intensity"
+  
+# fetch_EmberData <- function(dataset, iso_codes, api_key, frequency = "monthly") {
+#   valid_dataset <- c("capacity","electricity-generation", "power-sector-emissions", "electricity-demand", "carbon-intensity")
+#   valid_frequencies <- c("yearly", "monthly")
+#   
+#   if (!(dataset %in% valid_dataset)) {
+#     stop("Invalid dataset name. Please use one of 'electricity-generation', 'power-sector-emissions', 'electricity-demand', or 'carbon-intensity'.")
+#   }
+#   
+#   if (!(frequency %in% valid_frequencies)) {
+#     stop("Invalid frequency. Please use 'yearly' or 'monthly'.")
+#   }
+#   
+#   query_url <- sprintf("%s/v1/%s/%s?entity_code=%s&is_aggregate_series=false&start_date=2000&api_key=%s",
+#                        base_url, dataset, frequency, paste(iso_codes, collapse=","), api_key)
+#   response <- GET(query_url)
+#   stop_for_status(response)
+#   content(response, as="text", encoding = 'UTF-8') %>%
+#     fromJSON() %>%
+#     .$data %>%
+#     as_tibble()
+# }
+
+# # Provide quarter information
+# quarter <- 2 ### when running new quarter don't forget to change cache of API chunk to run
+# last_year <- 2024
+# nbr_months_waterfall <- 12 # using 12 to also get for the whole year and then just keep the quarter months
+# 
+# # Map quarters to their corresponding months
+# quarter_months <- list(c(1, 3), c(4, 6), c(7, 9), c(10, 12))
+# last_month <- quarter_months[[quarter]][2]  # Get the last month of the quarter
+# 
+# # Generate months function
+# generate_months <- function(last_year, last_month, nbr_months) {
+#   seq(as.Date(sprintf("%d-%02d-01", last_year, last_month)) %m-% months(nbr_months-1),
+#       as.Date(sprintf("%d-%02d-01", last_year, last_month)), by="1 month")
+# }
+# 
+# months_old_waterfall <- generate_months(last_year - 1, last_month, nbr_months_waterfall)
+# months_new_waterfall <- generate_months(last_year, last_month, nbr_months_waterfall)
+# months_expected <- format(months_new_waterfall, "%m")
+```
+
+**Ember methodology related to projected monthly data**
+
+In several cases monthly data is reported on a lagged basis, or data may not be available. In these cases, incomplete months are projected based on both seasonal and interannual trends. We aim to produce sensible figures (i.e. roughly what would be expected by eye), rather than trying to accurately account for e.g. unusual weather conditions in a given month. Projected data is not released for individual countries on a monthly level, but can play a small role in some monthly regional and country-level annual figures.
+
+The approach uses a series of ARIMA models organised as follows:
+
+- Demand is projected using projected GDP from the world bank as an exogenous variable
+
+- Non-dispatchable generation sources are projected. For this purpose we assume wind, solar, hydro, nuclear, and other renewables are not dispatchable
+
+- Residual demand is calculated to be met by dispatchable generation and imports. Dispatchable generation (coal, gas, other fossil, and bio) is projected using residual demand as an exogenous variable
+
+- Residual demand is recalculated to be met by imports. Imports are projected using this residual demand as an exogenous variable, with magnitude bounded at their historical maximum plus 10%.
+
+- If there is any remaining discrepancy between projected demand and the sum of projected generation and imports, dispatchable generation is scaled to remove this
+
+****
+
+**Notes on Ember data**
+
+- Area has both all countries in BFF Europe (except for Albania, so 38 countries) and the regional estimates for both EU and Europe
+
+- Regional Europe countries probably match the countries under "Ember region" == Europe column, but can't find confirmation for this in methodology
+
+- "Ember region" == Europe column countries include Russia and there is no Albania data, the remaining countries match BFF Europe list (38 countries).
+
+- EU regional has data for net imports while Europe regional does not, so we can use net imports predictions to adjust missing data for EU countries but not for non-EU countries.
+
+****
+
+**Steps for an approach to predict missing data and adjust fuel and country data to add up to Regional EU Ember:**
+
+1. Demand Analysis
+
+   a. Identify missing demand data for countries/months.
+   
+   b. Predict missing demand using ARIMA models.
+   
+   c. Adjust country-level demand to match regional EU demand.
+   
+2. Generation and Imports:
+
+   a. Predict missing Net Imports and Total Generation data.
+   
+   b. Calculate adjusted Total Generation using adjusted Demand and predicted Net Imports.
+   
+3. Fuel-Specific Data:
+
+   a. Predict missing fuel-specific generation data.
+   
+   b. Adjust fuel data to ensure consistency with adjusted Total Generation.
+   
+4. Data Consolidation: Combine all processed data into a final, consistent dataset.
+
+****
+
+# Explore data
+
+Use data from download file because we need regional EU data which is not available through the API.
+
+```{r}
+# Read the ISO codes from the file
+iso_codes_df <- read.delim('/Users/acas/Dropbox/BFF/projects/BFFcountries.txt')
+iso_codes <- iso_codes_df$Iso3
+
+## check for next releases if the link stays the same: https://ember-climate.org/app/uploads/2022/07/monthly_full_release_long_format-4.csv 
+## this link has more data than the API, like the values for EU and Europe.
+
+# download.file('https://ember-climate.org/app/uploads/2022/07/monthly_full_release_long_format-4.csv', paste0('monthly_full_release_long_format-4_', 
+#                      str_remove_all(Sys.Date(), "-"), ".csv"), mode = "wb")
+
+dfdown0 <- read_csv(paste0('monthly_full_release_long_format-4_', 
+                           # str_remove_all(Sys.Date(), "-"), ".csv"), show_col_types = FALSE) %>% 
+                           str_remove_all('20240826', "-"), ".csv"), show_col_types = FALSE) %>% 
+  filter(Date >= "2015-01-01")
+
+### keep data per fuel, total generated, net imports and demand
+dfdown <- dfdown0 %>% 
+  filter(`Country code` %in% iso_codes | Area %in% c('EU','Europe'), # excludes Russia
+         !Category %in% c('Power sector emissions','Electricity prices'),
+         !Subcategory %in% 'Aggregate fuel',
+         Unit %in% 'TWh') %>% 
+  select(Area, `Country code`, EU, Date, Variable, Value)
+```
+
+## Check overview of temporal data 
+
+```{r}
+### Check all the "areas" in the data
+unique(dfdown$Area)
+
+### Check all the "variables" in the data
+unique(dfdown$Variable)
+
+### Get how many months of information per area with min and max months
+monthsOverview <- dfdown %>%  
+  filter(Variable %in% 'Demand') %>% 
+  group_by(Area) %>% 
+  reframe(EU = unique(EU),
+          "Total Months" = n() , 
+          "Minimum Month" = min(Date, na.rm = TRUE), 
+          "Maximum Month" = max(Date, na.rm = TRUE))  
+
+monthsOverview  %>% 
+  datatable(
+    filter = "top",  
+    rownames = FALSE, 
+    extensions = 'Scroller', 
+    options = list(
+      autoWidth = TRUE,
+      deferRender = TRUE,
+      scrollY = 300,
+      scrollX = TRUE,    # Enable horizontal scrolling
+      scroller = TRUE, 
+      orderMulti = TRUE,  # Enable multiple column sorting
+      initComplete = JS(
+        "function(settings, json) {",
+        "$('.dataTables_wrapper').css('font-size', '12px');",  # Adjust font size here
+        "}"
+      )
+    ),
+    caption = htmltools::tags$caption(
+      style = 'caption-side: bottom; text-align: left; font-size: 12px; color: #777; font-style: italic;',
+      'Note: Hold Shift to sort by multiple columns'
+    )
+  )
+```
+
+## Compare regional with estimated demand from country data
+
+Regional Europe and regional EU (Area column), estimated Europe (sum of countries from Ember region column), estimated EU (sum of countries from EU column) and BFF Europe (sum of BFF countries)
+
+```{r}
+demandEUEuropeRegional <- filter(dfdown, Area %in% c('EU', 'Europe'), 
+                         Variable %in% 'Demand') %>% 
+  mutate(set = ifelse(Area == 'EU', 
+                      'EU - regional', 
+                      'Europe - regional'))
+
+## 39 countries
+demandEuropeEstimated <- filter(dfdown0, `Ember region` == 'Europe', 
+                         Variable %in% 'Demand', 
+                         ) %>% 
+  group_by(Date) %>% 
+  summarize(set = 'Europe - estimated',
+            Value = sum(Value, na.rm = TRUE))
+
+demandEUEstimated <- filter(dfdown0, EU == 1, 
+                         Variable %in% 'Demand') %>% 
+  group_by(Date) %>% 
+  summarize(set = 'EU - estimated',
+            Value = sum(Value, na.rm = TRUE))
+
+demandBFF <- filter(dfdown, !Area %in% c('EU', 'Europe'), 
+                         Variable %in% 'Demand') %>% 
+  group_by(Date) %>% 
+  summarize(set = 'BFF Europe - estimated',
+            Value = sum(Value, na.rm = TRUE))
+
+demandComp <- bind_rows(demandEUEstimated, demandEuropeEstimated, demandEUEuropeRegional, demandBFF) %>% 
+  mutate(set = factor(set, levels=c('Europe - regional', 
+                                    'Europe - estimated', 
+                                    'BFF Europe - estimated',
+                                    'EU - regional',
+                                    'EU - estimated'))) 
+
+q1 <- demandComp %>%
+  ggplot(aes(x = Date, y = Value, color = set)) +
+  geom_line() +
+  geom_point() +
+  theme_classic() +
+  labs(y = 'Demand TWh since 2015', x = NULL, colour = NULL) 
+
+q2 <- filter(demandComp, Date >= "2024-01-01") %>%
+  ggplot(aes(x = Date, y = Value, color = set)) +
+  geom_line() +
+  geom_point() +
+  theme_classic() +
+  labs(y = 'Demand TWh in 2024', x = NULL, colour = NULL) 
+
+(q1 + q2 & theme(legend.position = "bottom")) + 
+  plot_layout(guides = "collect", widths = c(2, 1))  
+
+dfdown1 <- dfdown %>%
+  filter(Date >= "2017-01-01")
+```
+
+Better to use EU demand estimates to bound the model and only from 2017 onwards. Shouldn't use Regional Europe to adjust non-EU countries since this includes Russia, although could remove the Russia data from Europe regional and make the adjustment, but given there is no net imports for Regional Europe, it might make more sense to use non-EU countries data without adjustment.
+
+
+## Identify the months and countries missing data for the last 12 months
+
+```{r}
+missing_data <- dfdown1 %>%
+  group_by(Area, Date, Variable) %>%
+  summarize(EU = unique(EU),
+            missing = any(is.na(Value)), .groups = 'drop') 
+
+length(unique(missing_data$Date)) #months with available data to project since 2017
+missing_lastYear <- missing_data %>%
+  filter(Date > today() - months(13)) %>% # the current month won't have data
+  group_by(Area, Variable) %>%
+  summarise(EU = unique(EU),
+            months_with_data = sum(!missing), .groups = 'drop') %>%
+  pivot_wider(names_from = Variable, values_from = months_with_data, values_fill = 0) %>% 
+  relocate(c(Demand,`Net Imports`, `Total Generation`), .before = Bioenergy) %>% 
+  arrange(desc(EU), Area)
+
+missing_lastYear %>%  ##to get an overview for which countries and fuels there is data since June 2023 (not excluding zeros)
+  mutate_if(is.numeric, round, 3) %>% 
+  datatable(
+    filter = "top",  
+    rownames = FALSE, 
+    extensions = 'Scroller', 
+    options = list(autoWidth = TRUE,
+                   deferRender = TRUE,
+                   scrollY = 300,
+                   scrollX = TRUE,    # Enable horizontal scrolling
+                   scroller = TRUE, 
+                   initComplete = JS(
+                     "function(settings, json) {",
+                     "$('.dataTables_wrapper').css('font-size', '10px');",  # Adjust font size here
+                     "}")))
+```
+
+Better to use demand to initially identify which countries and months to do the predictions
+
+# EU countries adjustments with predictions when needed
+
+## Demand adjustment to Regional EU
+
+### Compare against Regional EU demand
+
+```{r}
+#| fig-height: 6    # Set default figure height for all chunks
+#| fig-width: 12  
+
+# Aggregate the country-level Demand data for each month
+demand_EU_Estimated <- dfdown1 %>%
+  filter(Variable == "Demand", EU == 1) %>%
+  group_by(Date) %>%
+  summarize(EU_Estimated = sum(Value, na.rm = TRUE), .groups = 'drop')
+
+# Extract the EU Demand data for the same months
+demand_EU_Regional <- dfdown1 %>%
+  filter(Area == "EU", Variable == "Demand", Date %in% demand_EU_Estimated$Date) %>%
+  select(Date, EU_Regional = Value)
+
+# Merge the country-aggregated and EU data for comparison
+compEU <- left_join(demand_EU_Estimated, demand_EU_Regional, by = "Date") %>%
+  mutate(difference = EU_Regional - EU_Estimated)
+
+# View the comparison to see any discrepancies
+
+q3 <- ggplot(compEU, aes(x = EU_Estimated, y = EU_Regional)) +
+  geom_abline() +
+  geom_smooth(method = 'lm') +
+  geom_point() +
+  theme_classic() + 
+  scale_y_continuous(expand = c(0.01 ,0)) +
+  scale_x_continuous(expand = c(0.01 ,0))
+
+q4 <- ggplot(compEU, aes(x = Date, y = difference)) +
+  geom_col() +
+  labs(y = "Difference between regional and estimated EU demand", x = NULL) +
+  scale_x_date(expand = c(0.01 ,0), date_breaks = "1 year", date_labels = "%Y %b") +
+  scale_y_continuous(expand = c(0.01 ,0)) +
+  theme_classic()
+
+q3 + q4
+```
+
+The estimated EU values from adding up all countries seem to be highly correlated enough but the difference seem to be higher prior to 2019.
+
+### Predict demand missing data using ARIMA
+
+```{r}
+demand_filtered <- dfdown1 %>%
+  filter(Date >= "2019-01-01", 
+         Variable == "Demand", 
+         EU == 1)
+
+# Create a complete date sequence from min to max months used for all countries
+all_dates <- seq(from = min(demand_filtered$Date), to = max(demand_filtered$Date), by = "month")
+
+# Generate a complete dataset with all Areas, all Dates and all variables
+complete_data <- expand_grid(Area = unique(demand_filtered$Area), 
+                             EU = 1,
+                             Date = all_dates, 
+                             Variable = unique(dfdown1$Variable))
+
+# Filter to just demand data and left join with the existing demand_filtered to identify missing entries
+demand_complete <- complete_data %>%
+  filter(Variable %in% 'Demand') %>% 
+  left_join(demand_filtered, by = c("EU", "Area", "Date", "Variable"))  %>% # Mark rows as missing where the Value is NA
+  mutate(missing = ifelse(is.na(Value), TRUE, FALSE))
+
+demand_complete %>%
+  group_by(Area) %>%
+  summarize(missing_months = sum(missing), 
+            total_months = n(), .groups = 'drop') %>% 
+  filter(missing_months != 0)
+
+
+# Function to fit ARIMA and predict missing data - needs to include the rows with the missing data to predict
+predict_missing_data <- function(data) {
+  data <- data %>% 
+    mutate(predicted = ifelse(is.na(Value), TRUE, FALSE)) # Create a new column to flag predicted values
+  
+  if(any(is.na(data$Value))) {
+    # Fit ARIMA model to non-missing data
+    fit <- auto.arima(data$Value, seasonal = TRUE)
+    
+    # Predict missing values
+    missing_index <- which(is.na(data$Value))
+    data$Value[missing_index] <- forecast(fit, h = length(missing_index))$mean
+  }
+  
+  return(data)
+}
+
+# Apply the function to each country's Demand data
+predicted_data <- demand_complete %>%
+  group_by(Area) %>%
+  nest() %>%
+  mutate(data = map(data, predict_missing_data)) %>%
+  unnest(data) %>% 
+  rename(pred_Value = Value)
+
+filter(predicted_data, predicted == TRUE)
+```
+
+### Adjust Predictions to Match EU Totals
+
+```{r}
+#| fig-height: 6    # Set default figure height for all chunks
+#| fig-width: 8 
+ 
+# Aggregate predicted data at the EU level
+predicted_EU_demand <- predicted_data %>%
+  group_by(Date) %>%
+  summarize(predicted_EU = sum(pred_Value, na.rm = TRUE), .groups = 'drop')
+
+# Compare predicted EU data with EU Regional data
+compEUpred <- predicted_EU_demand %>%
+  left_join(demand_EU_Regional, by = "Date") %>%
+  mutate(adjustment_factor = EU_Regional / predicted_EU)
+
+# Apply the EU-wide adjustment to country-level predictions
+predAdjusted_data <- predicted_data %>%
+  left_join(select(compEUpred, Date, adjustment_factor), by = "Date") %>%
+  mutate(PredAdjusted_Value = pred_Value * adjustment_factor) %>%
+  select(-adjustment_factor)
+
+ggplot(predAdjusted_data, aes(x = PredAdjusted_Value, 
+                                       y = pred_Value)) +
+  geom_abline() +
+  geom_smooth(method = 'lm') +
+  geom_point(aes(size = predicted, shape = predicted)) +
+  theme_classic() + 
+  scale_y_continuous(expand = c(0.01 ,0)) +
+  scale_x_continuous(expand = c(0.01 ,0)) +
+  scale_shape_manual(values = c(20,21)) +
+  labs(y = "Demand with the values that were predicted", 
+       x = "Demand with adjusted values given Regional EU demand",
+       subtitle = paste(table(predAdjusted_data$predicted)[2], 'values were predicted'))
+
+paste0("Counts of values different between EU regional and adjusted estimated > 0.00001: ",
+       predAdjusted_data %>%
+  group_by(Date) %>%
+  summarize(PredAdjusted_EU = sum(PredAdjusted_Value, na.rm = TRUE), .groups = 'drop') %>%
+  left_join(compEUpred, by = 'Date') %>%
+  tally(abs((EU_Regional-PredAdjusted_EU)) > 0.00001) %>% 
+    pull(n))
+
+```
+
+No value has a difference bigger than 0.00001 between EU regional values and the adjusted and predicted added up EU estimates.
+
+## Net imports predictions to calculate adjusted total generation given adjusted to EU regional demand
+
+```{r}
+## get the complete rows with the fuel values
+complete_data2 <- left_join(complete_data, dfdown1) 
+
+# Predict Net Imports using the ARIMA function
+net_imports_data <- complete_data2 %>% 
+  filter(Area %in% unique(pull(filter(predicted_data, predicted == TRUE), Area)), 
+         Variable == "Net Imports")  %>%
+  group_by(Area) %>%
+  nest() %>%
+  mutate(data = map(data, predict_missing_data)) %>%
+  unnest(data) %>% 
+  rename(pred_Imports = Value)
+
+# Predict Total Generation using the defined ARIMA function to keep if needed eventually
+total_generation_data <- complete_data2 %>% 
+  filter(Area %in% unique(pull(filter(predicted_data, predicted == TRUE), Area)), 
+         Variable == "Total Generation")  %>%
+  group_by(Area) %>%
+  nest() %>%
+  mutate(data = map(data, predict_missing_data)) %>%
+  unnest(data) %>% 
+  rename(pred_Total = Value)
+
+# Get the adjusted Total generation from predicted Imports and predicted Demand
+pred_missing_ImpTotal <- filter(predAdjusted_data, predicted == TRUE) %>%  
+  left_join(select(net_imports_data, Area, Date, pred_Imports)) %>% 
+  left_join(select(total_generation_data, Area, Date, pred_Total)) %>% 
+  rename(PredAdjusted_Demand = PredAdjusted_Value) %>% 
+  mutate(adjusted_Total = PredAdjusted_Demand - pred_Imports)
+pred_missing_ImpTotal
+```
+
+## Fuels adjustment to EU regional
+
+Estimate adjusted fuels by taking a adjusted total generation from the EU regional adjusted demand and the per country/fuel net imports.
+
+### Prediction and adjustment for missing countries/months per fuel + country + month 
+
+```{r}
+# Predict per fuel and adjust based on adjusted total
+fuel_types <- filter(complete_data2, !Variable %in% 
+                       c("Demand","Net Imports", "Total Generation")) %>% 
+  pull(Variable) %>% 
+  unique()
+
+missingCountries_fuel_data <- complete_data2 %>% 
+  filter(Area %in% unique(pull(filter(predicted_data, predicted == TRUE), Area)), 
+         Variable %in% fuel_types)  
+
+final_fuel_predictions <- list()
+# Loop through each country with missing data
+for (country in unique(pred_missing_ImpTotal$Area)) {
+  
+  missingDates <- filter(predicted_data, predicted == TRUE, Area == country) %>% 
+    pull(Date)
+  
+  # Filter for the specific country
+  country_data <- missingCountries_fuel_data %>% 
+    filter(Area == country) %>%
+    ## deal with the fuels that are missing in historical data, consider them zeros. If not doing this it will predict values for month for which there is data
+    mutate(Value = case_when(!Date %in% missingDates & is.na(Value) ~ 0,
+                             TRUE~Value)) 
+  
+  # Initialize an empty list to store fuel predictions for this country
+  country_fuel_predictions <- list()
+  ## Loop through each fuel type
+  for (fuel in fuel_types) {
+    
+    # Predict fuel contribution using the defined ARIMA function
+    fuel_data <- country_data %>% 
+      filter(Variable == fuel)
+    
+    predicted_fuel <- predict_missing_data(fuel_data) %>% 
+      filter(predicted == TRUE)
+    
+    # Store the fuel predictions
+    country_fuel_predictions[[fuel]] <- predicted_fuel
+  }
+  
+  # Combine all the fuel predictions for this country
+  country_fuels_df <- bind_rows(country_fuel_predictions)
+  
+  # Check if the sum of predicted fuels matches the adjusted Total Generation
+  sum_predicted_fuels <- country_fuels_df %>% 
+    group_by(Area, Date) %>%
+    summarize(sum_fuels = sum(Value, na.rm = TRUE)) %>% 
+    left_join(select(pred_missing_ImpTotal, Area, Date, adjusted_Total)) %>%
+    mutate(adjustment_factor = adjusted_Total / sum_fuels)
+  
+  # Store the adjusted fuel predictions for each country
+  final_fuel_predictions[[country]] <- country_fuels_df %>%
+    left_join(sum_predicted_fuels) %>%
+    mutate(adjusted_valueFuel = Value * adjustment_factor) %>%
+    select(Area, Date, Variable, Value, adjusted_valueFuel)
+}
+
+# Combine all missing countries' fuel predictions 
+missing_fuel_predictions_df <- bind_rows(final_fuel_predictions)
+
+missingFinal <- select(pred_missing_ImpTotal, -Variable, -`Country code`, -missing) %>% 
+  rename(`Net Imports` = pred_Imports, `Total Generation` = pred_Total,
+         Demand = pred_Value, adjusted_Demand = PredAdjusted_Demand ) %>% 
+  left_join(missing_fuel_predictions_df)
+```
+
+### Adjustment of non missing countries/months
+
+```{r}
+# Create a DataFrame for fuels without the missing data
+nonmissing_fuel <- complete_data2 %>%
+  filter(Variable %in% fuel_types) %>%
+  select(Area, EU, Date, Variable, Value) %>% 
+  replace_na(list(Value = 0)) ### assume missing fuels are just 0s
+
+# Left Join Net Imports, Total Generation, and Demand per fuel/country/date and get adjusted Total for non missing
+fuel_adjustment_data <- complete_data2 %>%
+    filter(!Variable %in% fuel_types) %>%
+    select(Area, EU, Date, Variable, Value) %>% 
+  pivot_wider(names_from = Variable, values_from = Value) %>% 
+  left_join(nonmissing_fuel) %>% 
+  left_join(select(predAdjusted_data, Area, Date, predicted, PredAdjusted_Value)) %>% 
+  rename(PredAdjusted_Demand = PredAdjusted_Value) %>%
+  mutate(adjusted_Total = PredAdjusted_Demand - `Net Imports`) %>%
+    filter(predicted == FALSE)
+
+# Apply Adjustment Factor to Fuels for non missing
+adjusted_fuel_data <- fuel_adjustment_data  %>% 
+  group_by(Area, Date) %>%
+  mutate(sum_fuels = sum(Value, na.rm = TRUE),
+         adjustment_factor = adjusted_Total / sum_fuels,
+         adjusted_valueFuel = Value * adjustment_factor) %>%
+  select(Area, Date, Variable, adjusted_valueFuel)
+
+# clean data for both missing and non missing as well demand/total/net imports and adjusted
+finalDataEU <- left_join(fuel_adjustment_data, adjusted_fuel_data) %>% 
+  rename(adjusted_Demand = PredAdjusted_Demand) %>% 
+  bind_rows(missingFinal) %>% 
+  relocate(c(EU, predicted,`Net Imports`, `Total Generation`, adjusted_Total, Demand, adjusted_Demand), .before = Variable) %>% 
+  rename(Fuel = Variable, Fuel_value = Value, AdjustedFuel_value = adjusted_valueFuel)
+
+```
+
+****
+
+```{r}
+#| echo: false
+library(plotly)
+library(crosstalk)
+
+finalDataEU$predicted_Label <- ifelse(finalDataEU$predicted, "Predicted", "Actual value")
+
+# Create a SharedData object for linking the data with filters
+shared_finalData <- SharedData$new(finalDataEU)
+
+# Arrange the filters side by side using bscols
+bscols(
+  widths = c(3,NA),  # Adjust widths to fit your layout needs
+  
+  list(
+  filter_select("fuel", "Select Fuel:", shared_finalData, ~Fuel),
+  filter_select("area", "Select Country:", shared_finalData, ~Area)
+  ),
+  
+  # Create the Plotly scatter plot using color to differentiate 'predicted'
+  plot_ly(shared_finalData) %>%
+    add_trace(
+      x = ~AdjustedFuel_value,
+      y = ~Fuel_value,
+      color = ~predicted_Label,
+      colors = c('black', 'red'),
+      type = 'scatter',
+      mode = 'markers',
+      text = ~paste(
+        "Date:", Date,
+        "<br>Actual generation:", round(Fuel_value, 2),
+        "<br>Adjusted generation:", round(AdjustedFuel_value,2),
+        "<br>Predicted value:", predicted
+      ),
+      hoverinfo = 'text'  # Use the text provided in `text` for the tooltip
+    )  %>%
+    layout(
+      
+      title = "Visualize how adjusted values compare to actual data per country and fuel",
+      xaxis = list(
+        title = "Adjusted fuel values given Regional EU",
+        autorange = TRUE
+      ),
+      yaxis = list(
+        title = "Actual fuel values",
+        autorange = TRUE
+      )
+    )
+)
+```
+
+# Non-EU countries predictions
+
+- Not doing adjustments based on regional data for these countries
+
+- Moldova only has data starting in 2020 while Kosovo only has data starting in 2022, so it would be better to make predictions based on each country minimum month
+
+- Exclude Ukraine from making predictions since data only goes until Sept 2022
+
+- Predict data for fuels and net imports for each country then get demand and total generation from predicted data.
+
+
+```{r}
+nonEU_filtered <- dfdown1 %>%
+  filter(Date >= "2019-01-01",
+         !Area %in% 'Ukraine',
+         EU == 0)
+
+# get missing months per country based on Demand data
+nonEU_filtered_demand <- nonEU_filtered %>%
+  filter(Variable %in% "Demand") %>% 
+  select(Area, Date, NotMissing = Variable)
+
+# Create a complete date sequence for the same date range as the EU dataset
+all_dates <- seq(from = min(finalDataEU$Date), to = max(finalDataEU$Date), by = "month")
+
+# need to exclude months of the 2 countries with minimum date after 2019
+set2 <- filter(monthsOverview, `Minimum Month` > min(nonEU_filtered$Date)) %>% 
+  select(Area, Date = `Minimum Month`) %>% 
+  mutate(remove = 1)
+set2
+
+# Generate a complete dataset with all Areas, all Dates and all variables
+complete_dataNonEU <- expand_grid(Area = unique(nonEU_filtered$Area), 
+                             EU = 0,
+                             Date = all_dates, 
+                             Variable = unique(nonEU_filtered$Variable))   %>%
+  left_join(set2, by = "Area")  %>%
+  filter(!(Date.y > Date.x) | is.na(remove) ) %>%  # exclude rows which Date is previous to minimum date available for a given country
+  select(-remove, -Date.y, Date = Date.x) %>% 
+  left_join(dfdown1) %>% 
+  left_join(nonEU_filtered_demand) %>% ### to deal with the values that are missing in historical data, consider them zeros. If not doing this it will predict values for month for which there is data
+  mutate(Value = ifelse(is.na(Value) & !is.na(NotMissing), 0, Value)) %>% 
+  select(-NotMissing) 
+
+## nonEU countries predicting data:
+missingMonths <- filter(complete_dataNonEU, is.na(Value)) %>% 
+  select( Area, Date) %>% 
+  distinct()
+
+missingMonths 
+
+# Predict per fuel and for net imports
+fuelImp_types <- c(fuel_types, "Net Imports")
+
+nonEU_predictions <- list()
+# Loop through each country with missing data
+for (country in unique(missingMonths$Area)) {
+  
+  # Filter for the specific country
+  country_data <- complete_dataNonEU %>% 
+    filter(Area == country,
+           !Variable %in% c("Demand", "Total Generation")) 
+  
+  # Initialize an empty list to store fuel predictions for this country
+  country_fuel_predictions <- list()
+  ## Loop through each fuel type
+  for (fuel in fuelImp_types) {
+    
+    # Predict fuel contribution using the defined ARIMA function
+    fuel_data <- country_data %>% 
+      filter(Variable == fuel)
+    
+    predicted_fuel <- predict_missing_data(fuel_data) %>% 
+      filter(predicted == TRUE)
+    
+    # Store the fuel predictions
+    country_fuel_predictions[[fuel]] <- predicted_fuel
+  }
+  
+  # Combine all the fuel predictions for this country
+  country_fuels_df <- bind_rows(country_fuel_predictions)
+  
+  ## get total generation and demand from predicted data
+  Total_predicted_fuels <- country_fuels_df %>% 
+    filter(!Variable %in% "Net Imports") %>% 
+    group_by(Area, Date) %>%
+    summarize(`Total Generation` = sum(Value, na.rm = TRUE)) 
+  
+  Demand_predicted_fuels <- country_fuels_df %>% 
+    filter(Variable %in% "Net Imports") %>% 
+    left_join(Total_predicted_fuels, by = join_by(Area, Date)) %>% 
+    mutate(Demand = `Total Generation` + Value) %>% 
+    select(Area, Date, `Net Imports` = Value, `Total Generation`, Demand)
+  
+  # Store the adjusted fuel predictions for each country
+  nonEU_predictions[[country]] <- country_fuels_df %>%
+    filter(!Variable %in% "Net Imports") %>% 
+    left_join(Demand_predicted_fuels, by = join_by(Area, Date)) 
+}
+
+# Combine all missing countries' fuel predictions 
+nonEU_predictions_df <- bind_rows(nonEU_predictions) %>% 
+  select(-`Country code`) 
+
+Final_nonEUComplete <- filter(complete_dataNonEU, !is.na(Value)) %>%
+  select(-`Country code`) %>% 
+  pivot_wider(names_from = Variable, values_from = Value) %>% 
+  pivot_longer(cols = !!fuel_types, names_to = 'Variable', values_to = 'Value') %>% 
+  mutate(predicted = FALSE) %>% 
+  bind_rows(nonEU_predictions_df) %>% 
+  rename(Fuel = 'Variable', Fuel_value = 'Value')
+```
+
+
+# Bringing together EU and nonEU data
+
+```{r}
+# clean data for both missing and non missing as well demand/total/net imports and adjusted, for EU and nonEU countries (not with adjusted values)
+finalData <- bind_rows(finalDataEU[-13], Final_nonEUComplete)
+```
+
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+finalData %>%
+  mutate_if(is.numeric, round, 3) %>% 
+      datatable(
+    filter = "top",  
+    rownames = FALSE, 
+    extensions = 'Scroller', 
+    options = list(
+      autoWidth = TRUE,
+      deferRender = TRUE,
+      scrollY = 400,
+      scrollX = TRUE,    # Enable horizontal scrolling
+      scroller = TRUE, 
+      orderMulti = TRUE,  # Enable multiple column sorting
+      initComplete = JS(
+        "function(settings, json) {",
+        "$('.dataTables_wrapper').css('font-size', '10px');",  # Adjust font size here
+        "}"
+      )
+    ),
+    caption = htmltools::tags$caption(
+      style = 'caption-side: bottom; text-align: left; font-size: 10px; color: #777; font-style: italic;',
+      'Note: Hold Shift to sort by multiple columns'
+    )
+  )
+```
+
+****
+
+**Visualizing fuel per country (with predicted but not adjusted data)**
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+library(jsonlite)
+# Prepare all data
+all_data <- finalData %>%
+  select(Area, Date, Fuel, Fuel_value)
+
+# Get unique areas for the dropdown
+areas <- unique(all_data$Area)
+
+# Convert to JSON for use in Observable
+ojs_define(all_data_json = toJSON(all_data))
+ojs_define(areas_json = toJSON(areas))
+```
+
+```{ojs}
+//| echo: false
+
+// Parse the JSON data
+data = JSON.parse(all_data_json)
+areas = JSON.parse(areas_json)
+
+// Create a dropdown for area selection
+viewof selectedArea = Inputs.select(areas, {label: "Select Area", value: areas[0]})
+
+// Define fuel types
+fuels = ["Solar", "Wind","Other Renewables", "Coal", "Gas",  "Other Fossil", "Hydro","Bioenergy",  "Nuclear"]
+
+// Function to filter and prepare data
+function prepareData(area, fuel) {
+  return data
+    .filter(d => d.Area === area && d.Fuel === fuel)
+    .map(d => ({...d, Year: d.Date.substring(0, 4)}));
+}
+
+// Function to create a single plot
+function createPlot(fuel) {
+  const plotData = prepareData(selectedArea, fuel);
+  
+  // Check for empty data or data with only zero values
+  if (plotData.length === 0 || plotData.every(d => d.Fuel_value === 0)) {
+    return html`<div style="width: 200px; height: 200px; display: flex; justify-content: right; align-items: center; ">
+      <p></p>
+    </div>`;
+  }
+  
+  return Plot.plot({
+      style: {
+      fontSize: "12px",
+      fontFamily: "OpenSans, sans-serif"
+    },
+    y: {grid: true, label: "", 
+    tickSize: 0
+      },
+    x: {
+      label: "",
+      tickFormat: d => d.endsWith("-01-01") ? d.substring(0, 4) : "",
+      ticks: plotData
+        .filter(d => d.Date.endsWith("-01-01"))
+        .map(d => d.Date),
+    },
+    marks: [
+      Plot.barY(plotData, {
+        x: "Date", 
+        y: "Fuel_value", 
+        fill: "steelblue",
+         tip: true,
+        title: d => `Date: ${d.Date}\nGeneration: ${d.Fuel_value.toFixed(2)} TWh`
+      })
+    ],
+    width: 300,
+    height: 300,
+    title: fuel  // Set the fuel type as the title
+  })
+}
+
+// Create a 3x3 grid of plots
+html`<div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px;">
+  ${fuels.map(fuel => html`<div>
+    <h3 style="text-align: center; margin-bottom: 1px;">${fuel}</h3>
+    ${createPlot(fuel)}
+  </div>`)}
+</div>`
+```
+
