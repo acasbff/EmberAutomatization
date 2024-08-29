@@ -56,7 +56,7 @@ The approach uses a series of ARIMA models organised as follows:
 
 **Steps for an approach to predict missing data and adjust fuel and country data to add up to Regional EU Ember:**
 
-1.  EU Demand 
+1.  EU Demand
 
     a.  Identify missing demand data for countries/months.
 
@@ -80,8 +80,7 @@ The approach uses a series of ARIMA models organised as follows:
 
     a.  Predict missing fuel-specific generation data, to then estimate total generation and demand from predicted values
 
-5. Join EU and Non-EU data
-
+5.  Join EU and Non-EU data
 
 ------------------------------------------------------------------------
 
@@ -98,7 +97,6 @@ Use data from download file because we need regional EU data which is not availa
 ### git push origin gh-pages
 ### verify in https://acasbff.github.io/EmberAutomization/
 ```
-
 
 ```{r}
 # Read the ISO codes from the file
@@ -768,7 +766,7 @@ finalData %>%
 
 ------------------------------------------------------------------------
 
-Visualizing fuel per country (with predicted but not adjusted data)
+**Visualizing fuel per country (with predicted but not adjusted data)**
 
 ```{r}
 #| echo: false
