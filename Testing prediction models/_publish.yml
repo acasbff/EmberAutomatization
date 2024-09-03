@@ -1,0 +1,4 @@
+- source: project
+  quarto-pub:
+    - id: a0d92c66-3eb3-487b-8f35-7d610c1d0986
+      url: 'https://acasbff.quarto.pub/testing-prediction-models'

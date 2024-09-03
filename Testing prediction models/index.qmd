@@ -1,0 +1,437 @@
+---
+title: "Comparison between R and python functions for prediction"
+date: "`r Sys.Date()`"
+author: 'Ana Afonso Silva'
+---
+
+```{r}
+#| echo: false
+library(tidyverse)
+library(reticulate)
+
+## original quarto at /Users/acas/Dropbox/BFF/projects/QuaterlyReports/Ember_API_python/testingPredictionModels_RPy.qmd
+
+##when using reticulate always change wd to a directory with permissions
+##utils::savehistory() ## can help figure out the error with ##reticulate::repl_python() being related with wd
+
+#setwd("/Users/acas/Dropbox/BFF/projects/QuaterlyReports/Ember_API_python/") ### this can't be used with quarto publish
+
+# Use the specific conda environment
+conda_path <- "/Users/acas/miniconda3/envs/r-reticulate"
+
+## reticulate::conda_list()
+use_condaenv(conda_path, required = TRUE)
+Sys.setenv(RETICULATE_PYTHON = "/Users/acas/miniconda3/envs/r-reticulate/bin/python")
+use_python("/Users/acas/miniconda3/envs/r-reticulate/bin/python", required = TRUE)
+
+## To verify the Python path
+#py_config()
+
+### to publish as a quarto pub: 1) make new directory project as quarto website (save in github folder), 2) copy quarto file content to index.qmd and yaml to _quarto.yml, 3) On terminal: a) quarto preview, b) quarto render, c) quarto publish quarto-pub
+```
+
+**Make test data from Ember EU data since 2019 with demand**
+
+```{r}
+#| code-fold: false
+
+# download.file('https://ember-climate.org/app/uploads/2022/07/monthly_full_release_long_format-4.csv',
+#               paste0('monthly_full_release_long_format-4_',
+#                      str_remove_all(Sys.Date(), "-"), ".csv"), mode = "wb")
+
+EU_subset <- read_csv("monthly_full_release_long_format-4_20240826.csv", 
+                      show_col_types = FALSE) %>% 
+  filter(Variable %in% 'Demand', EU == 1, Date >= "2019-01-01") %>% 
+  select(Area, Date, Value) 
+
+```
+
+## Run predictions with python models
+
+-   ARIMA (pmdarima): Uses auto_arima with seasonal=True and m=12 for automatic model selection, handling seasonality with a 12-month cycle.
+
+-   Prophet: Employs default settings, which include automatic changepoint detection and yearly seasonality.
+
+-   ARIMA (scikit-learn): Implements a custom ARIMA estimator with fixed order (1,1,1), suitable for integration with scikit-learn's API.
+
+```{python}
+## code developed with cursor
+## ## to install packages: /Users/acas/miniconda3/envs/r-reticulate/bin/pip install fbprophet
+
+import sys
+import os
+import pandas as pd
+import numpy as np
+from pmdarima import auto_arima
+from prophet import Prophet
+from sklearn.base import BaseEstimator, RegressorMixin
+from statsmodels.tsa.arima.model import ARIMA as StatsmodelsARIMA
+from sklearn.metrics import r2_score
+import warnings
+import traceback
+import logging
+
+logger = logging.getLogger('cmdstanpy')
+logger.addHandler(logging.NullHandler())
+logger.propagate = False
+logger.setLevel(logging.CRITICAL)
+logging.getLogger('prophet').setLevel(logging.CRITICAL)
+
+   
+# Suppress warnings
+warnings.filterwarnings("ignore")
+
+### load r object
+dfr = pd.DataFrame(r.EU_subset)
+dfr['Date'] = pd.to_datetime(dfr['Date'])
+
+df = dfr
+
+# print(dfr)
+# print(dfr.dtypes)
+
+# # Load the data - if needed to load locally 
+# df = pd.read_csv('/Users/acas/Dropbox/BFF/projects/QuaterlyReports/Ember_API_python/EU_subset.txt', 
+#                  sep='\t', parse_dates=['Date'])
+# print(df)
+# print(df.dtypes)
+
+# After loading, let's resample the data to monthly frequency
+df['Date'] = pd.to_datetime(df['Date']).dt.to_period('M').dt.to_timestamp()
+df = df.groupby(['Date', 'Area'])['Value'].mean().reset_index()
+
+# Set the date range for training and testing
+train_end = '2023-05-01'
+test_start = '2023-06-01'
+test_end = '2024-05-31'
+
+### functions to do predictions
+
+class ARIMAEstimator(BaseEstimator, RegressorMixin):
+    def __init__(self, order=(1,1,1)):
+        self.order = order
+    
+    def fit(self, X, y=None):
+        self.model_ = StatsmodelsARIMA(y, order=self.order)
+        self.results_ = self.model_.fit()
+        return self
+    
+    def predict(self, X):
+        return self.results_.forecast(steps=len(X))
+
+def fit_and_forecast(country_data, train_end, test_start, test_end):
+    # Ensure data is sorted by date
+    country_data = country_data.sort_index()
+
+    # Convert all date strings to datetime
+    train_end_dt = pd.to_datetime(train_end)
+    test_start_dt = pd.to_datetime(test_start)
+    test_end_dt = pd.to_datetime(test_end)
+
+    # Use all data up to and including the train_end month
+    train = country_data[country_data.index <= train_end_dt]
+    
+    # print(f"Train date range: {train.index.min()} to {train.index.max()}")
+
+    # Calculate the number of months between test_start and test_end
+    test_months = pd.date_range(start=test_start_dt, end=test_end_dt, freq='MS').shape[0]
+
+    # Generate forecast dates for the specified test period
+    forecast_dates = pd.date_range(start=test_start_dt, end=test_end_dt, freq='MS')
+
+    # Fit the pmdarima model
+    model_pmdarima = auto_arima(train['Value'], seasonal=True, m=12, suppress_warnings=True)
+    forecast_pmdarima, conf_int = model_pmdarima.predict(n_periods=test_months, return_conf_int=True)
+
+    # Fit the Prophet model
+    train_prophet = train.reset_index().rename(columns={'Date': 'ds', 'Value': 'y'})
+    model_prophet = Prophet()
+    model_prophet.fit(train_prophet)
+    future_dates = pd.DataFrame({'ds': forecast_dates})
+    forecast_prophet = model_prophet.predict(future_dates)['yhat']
+
+    # Fit the scikit-learn ARIMA model
+    model_sklearn = ARIMAEstimator(order=(1,1,1))
+    model_sklearn.fit(train.index, train['Value'])
+    forecast_sklearn = model_sklearn.predict(forecast_dates)
+
+    # Get actual values for the forecast period if available
+    actual = country_data[(country_data.index >= test_start_dt) & (country_data.index <= test_end_dt)]['Value']
+    
+    # print(f"Forecast length: {len(forecast_pmdarima)}")
+    # print(f"Forecast date range: {forecast_dates[0]} to {forecast_dates[-1]}")
+
+    # Create DataFrame with forecast and available actual data
+    result_df = pd.DataFrame({
+        'Date': forecast_dates,
+        'Actual': actual.reindex(forecast_dates),
+        'pmdarima': forecast_pmdarima,
+        'prophet': forecast_prophet.values,
+        'sklearn_arima': forecast_sklearn,
+        'Lower_CI': conf_int[:, 0],
+        'Upper_CI': conf_int[:, 1]
+    })
+    
+    return result_df
+
+### Process countries and get results
+all_results = []
+for country in df['Area'].unique():
+    #print(f"\nProcessing {country}...")
+    country_data = df[df['Area'] == country].set_index('Date')
+    try:
+        country_results = fit_and_forecast(country_data, train_end, test_start, test_end)
+        country_results['Area'] = country
+        all_results.append(country_results)
+    except Exception as e:
+        print(f"Error processing {country}: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+
+### Combine all results
+if all_results:
+    final_results = pd.concat(all_results, ignore_index=True)
+
+    # Export results to CSV
+    final_results.to_csv('multi_country_comparison.csv', index=False)
+    #print("\nComparison data exported to multi_country_comparison.csv")
+else:
+    print("No results were generated. Please check the errors above.")
+```
+
+## Run predictions with R models
+
+-   auto.arima: Automatically selects the best ARIMA model based on AIC, BIC or AICc value. The process involves:
+
+    -   Starting with a default model (usually ARIMA(2,1,2) for non-seasonal data)
+
+    -   Varying the parameters (p,d,q) stepwise and fitting multiple models
+
+    -   Comparing models using the specified information criterion (default is AICc)
+
+    -   Optionally performing stepwise selection to refine the model further
+
+    -   Choosing the model with the lowest information criterion value as the best fit
+
+-   ETS: Fits an ExponenTial Smoothing model, automatically selecting the best model from various options (trend, seasonality, error types).
+
+-   TBATS: Implements Trigonometric, Box-Cox transform, ARMA errors, Trend, and Seasonal components model. TBATS is particularly useful for time series with complex seasonal patterns that are difficult to capture with traditional methods.
+
+-   NNETAR: Fits a feed-forward neural network model with autoregressive inputs, using default settings for network architecture.
+
+-   STLM: Applies Seasonal and Trend decomposition using Loess (STL) with a chosen forecasting method (default is ETS) for the seasonally adjusted data.
+
+```{r}
+library(tidyverse)
+library(forecast)
+library(lubridate)
+library(urca)
+
+df <- EU_subset
+# Read the data if needed
+#df <- read_delim("/Users/acas/Dropbox/BFF/projects/QuaterlyReports/Ember_API_python/EU_subset.txt")
+
+# Function to analyze a single country
+analyze_country <- function(country_data) {
+  tryCatch({
+    # Check if there's enough data
+    if (nrow(country_data) < 24) {
+      stop("Not enough data for analysis (less than 24 months)")
+    }
+    
+    # Split data into training and test sets
+    train_data <- country_data[country_data$Date <= as.Date("2023-05-01"), ]
+    test_data <- country_data[country_data$Date >= as.Date("2023-05-01") & country_data$Date < as.Date("2024-05-01"), ]
+    
+    if (nrow(train_data) < 12 || nrow(test_data) < 12) {
+      stop("Insufficient data for train or test set (less than 12 months)")
+    }
+    
+    # Create time series object
+    ts_train <- ts(train_data$Value, frequency=12, start=c(year(min(train_data$Date)), month(min(train_data$Date))))
+    
+    # Fit models and forecast
+    # 1. auto.arima
+    auto_model <- auto.arima(ts_train)
+    auto_forecast <- forecast(auto_model, h=12)
+    
+    # 2. ETS
+    ets_model <- ets(ts_train)
+    ets_forecast <- forecast(ets_model, h=12)
+    
+    # 3. TBATS
+    tbats_model <- tbats(ts_train)
+    tbats_forecast <- forecast(tbats_model, h=12)
+    
+    # 4. NNETAR
+    nnetar_model <- nnetar(ts_train)
+    nnetar_forecast <- forecast(nnetar_model, h=12)
+    
+    # 5. STLM
+    stlm_model <- stlm(ts_train)
+    stlm_forecast <- forecast(stlm_model, h=12)
+    
+    plot_data <- filter(country_data, Date > as.Date("2023-05-01") & Date < as.Date("2024-06-01")) %>%
+      rename(Actual = Value) %>%
+      left_join(data.frame(
+        Date = seq.Date(from = as.Date("2023-06-01"), by = "month", length.out = 12),
+        AutoArima_R = as.numeric(auto_forecast$mean),
+        ETS_R = as.numeric(ets_forecast$mean),
+        TBATS_R = as.numeric(tbats_forecast$mean),
+        NNETAR_R = as.numeric(nnetar_forecast$mean),
+        STLM_R = as.numeric(stlm_forecast$mean)
+      ), by = join_by(Date))
+    
+    return(plot_data)
+  }, error = function(e) {
+    warning(paste("Error processing country:", unique(country_data$Area), "-", e$message))
+    return(NULL)
+  })
+}
+
+# Analyze all countries
+Rresults <- df %>%
+  group_by(Area) %>%
+  group_modify(~analyze_country(.x)) %>%
+  filter(!is.null(.)) %>% 
+  ungroup()
+```
+
+## Comparing the different forecasting models for each country
+
+```{r}
+#| eval: true
+#| fig-width: 12
+#| fig-height: 16
+#| 
+pyResults <- reticulate::py$final_results # Access the Python object ### not sure why it stopped working
+
+### if needed
+pyResults <- read_csv("/Users/acas/Dropbox/BFF/projects/QuaterlyReports/Ember_API_python/multi_country_comparison.csv") 
+
+comp <- full_join(Rresults, pyResults, copy = TRUE) %>% 
+rename("Arima_R" ="AutoArima_R",   "sklearn_Py"="sklearn_arima", 
+       "prophet_Py"= "prophet" , "pmdarima_Py"="pmdarima")
+
+# Overview per country
+comp %>%
+  pivot_longer(Arima_R:sklearn_Py) %>%
+  ggplot(aes(x = Actual, y = value, color = name, linetype = grepl("_R$", name))) +
+  geom_abline() +
+  geom_smooth(method = 'lm', se = FALSE) +
+  #geom_point() +
+  facet_wrap(~Area, scales = 'free', ncol = 4) +
+  theme_bw() +
+  labs(title = "Comparison of Different Forecasting Models",
+       x = "Actual Values",
+       y = "Forecasted Values",
+       color = "Model",
+       linetype = "R Model") +
+  scale_linetype_manual(values = c("solid", "dotted")) +
+  theme(legend.position = "bottom")
+```
+
+## Comparing models using 2 metrics
+
+-   Mean Absolute Percentage Error (MAPE): Measures the average percentage difference between predicted and actual values. It's scale-independent, making it useful for comparing forecasts across different datasets.
+
+-   Root Mean Square Error (RMSE): Measures the standard deviation of the residuals (prediction errors). It's more sensitive to large errors and is in the same units as the response variable.
+
+-   If a model has low RMSE but high MAPE, it might be making large percentage errors on smaller values, while if a model has high RMSE but low MAPE, it might be making consistent percentage errors across all scales, but with some larger absolute errors.
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+#| eval: true
+
+models <- c("STLM_R", "TBATS_R", "NNETAR_R", "ETS_R", "Arima_R","sklearn_Py", "prophet_Py", "pmdarima_Py")
+
+calculate_mape <- function(actual, predicted) {
+  mean(abs((actual - predicted) / actual), na.rm = TRUE) * 100
+}
+
+# Function to calculate MAPE
+calculate_mape <- function(actual, predicted) {
+  mean(abs((actual - predicted) / actual), na.rm = TRUE) * 100
+}
+
+# Function to calculate RMSE
+calculate_rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+}
+
+# Calculate metrics for each country
+metrics_list <- comp %>%
+  group_by(Area) %>%
+  group_map(~ {
+    mape_results <- sapply(models, function(model) {
+      calculate_mape(.x$Actual, .x[[model]])
+    })
+    rmse_results <- sapply(models, function(model) {
+      calculate_rmse(.x$Actual, .x[[model]])
+    })
+    data.frame(
+      Area = .y$Area,
+      Model = models,
+      MAPE = mape_results,
+      RMSE = rmse_results
+    )
+  })
+
+# Combine results into a single dataframe
+metrics_df <- do.call(rbind, metrics_list)
+
+metrics_long <- metrics_df %>%
+  pivot_longer(cols = c(RMSE, MAPE), names_to = "Metric", values_to = "Value")
+
+metrics_long %>%
+  group_by(Metric, Model) %>%
+  summarise(Median = median(Value, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Metric) %>%
+  mutate(Is_Lowest = Median == min(Median, na.rm = TRUE)) %>%
+  ungroup() %>%
+  right_join(metrics_long, by = c("Metric", "Model")) %>%
+  ggplot(aes(x = fct_rev(fct_inorder(Model)), 
+             y = Value)) +
+  geom_boxplot(aes(fill = Is_Lowest), outliers = FALSE) +
+  geom_point(alpha = 0.5, position = position_jitter(width = 0.2, height = 0)) +
+  facet_wrap(~ Metric, scales = "free_x", ncol = 2) +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "lightgreen", "FALSE" = "white")) +
+  theme_bw() +
+  labs(title = "Comparison of Models based on RMSE and MAPE metrics",
+       subtitle = "The lower the better, highlighting green the model with the lowest median",
+       x = NULL, 
+       y = NULL) +
+  theme(legend.position = 'none',
+        strip.background = element_rect(fill = "lightgrey"),
+        strip.text = element_text(face = "bold"))
+```
+
+**Final visualization comparing the top-performing models (Arima_R, STLM_R, and pmdarima_Py)**
+
+```{r}
+#| fig-width: 7
+#| fig-height: 5
+#| eval: true
+
+comp %>%
+  pivot_longer(c(Arima_R, STLM_R, pmdarima_Py)) %>%
+  ggplot(aes(x = Actual, y = value, color = name)) +
+  geom_abline() +
+  geom_smooth(method = 'lm', se = FALSE) +
+  #geom_point() +
+  #facet_wrap(~Area, scales = 'free') +
+  theme_bw() +
+  labs(title = "Comparison of different forecasting models",
+       x = "Actual Values",
+       y = "Forecasted Values",
+       color = "Model",
+       linetype = "R Model") 
+```
+
+------------------------------------------------------------------------
+
+```{r}
+#| echo: false
+sessionInfo()
+```
